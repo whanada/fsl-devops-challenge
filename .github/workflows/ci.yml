@@ -1,4 +1,4 @@
-name: CI and ECR
+name: CI, ECR and Lightsail
 
 on:
   pull_request:
@@ -39,11 +39,14 @@ jobs:
         run: npm run build
 
   publish:
-    name: Publish image to ECR
+    name: Publish image and deploy to Lightsail
     needs: validate
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 40
+    concurrency:
+      group: lightsail-production
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
@@ -51,6 +54,7 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
       IMAGE_TAG: ${{ github.sha }}
+      LIGHTSAIL_SERVICE: fsl-challenge
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,4 +81,52 @@ jobs:
             docker login --username AWS --password-stdin "$REGISTRY"
           docker build --tag "$IMAGE_URI:$IMAGE_TAG" ./codebase/rdicidr-0.1.0
           docker push "$IMAGE_URI:$IMAGE_TAG"
+          printf 'DEPLOY_IMAGE=%s\n' "$IMAGE_URI:$IMAGE_TAG" >> "$GITHUB_ENV"
           printf 'Published image: `%s`\n' "$IMAGE_URI:$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy to Lightsail
+        shell: bash
+        run: |
+          set -euo pipefail
+          SERVICE=$(aws lightsail get-container-services --service-name "$LIGHTSAIL_SERVICE" --output json)
+          if ! jq -e '.containerServices[0].privateRegistryAccess.ecrImagePullerRole.isActive == true' <<< "$SERVICE" > /dev/null; then
+            echo 'Enable private ECR access in Lightsail > fsl-challenge > Images > Add repository.' >&2
+            exit 1
+          fi
+          CONTAINERS=$(jq -n --arg image "$DEPLOY_IMAGE" '{app: {image: $image, ports: {"80": "HTTP"}}}')
+          ENDPOINT='{"containerName":"app","containerPort":80,"healthCheck":{"path":"/","successCodes":"200","intervalSeconds":10,"timeoutSeconds":5,"healthyThreshold":2,"unhealthyThreshold":3}}'
+          VERSION=$(aws lightsail create-container-service-deployment \
+            --service-name "$LIGHTSAIL_SERVICE" \
+            --containers "$CONTAINERS" \
+            --public-endpoint "$ENDPOINT" \
+            --query 'containerService.nextDeployment.version' --output text)
+          [[ "$VERSION" =~ ^[0-9]+$ ]] || { echo 'No deployment version returned' >&2; exit 1; }
+          printf 'DEPLOY_VERSION=%s\n' "$VERSION" >> "$GITHUB_ENV"
+
+      - name: Wait for deployment and verify public URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            SERVICE=$(aws lightsail get-container-services --service-name "$LIGHTSAIL_SERVICE" --output json)
+            STATE=$(jq -r --argjson version "$DEPLOY_VERSION" '
+              [.containerServices[0] | .currentDeployment, .nextDeployment
+               | select(. != null and .version == $version) | .state][0] // "PENDING"' <<< "$SERVICE")
+            echo "Deployment $DEPLOY_VERSION: $STATE ($attempt/60)"
+            case "$STATE" in
+              ACTIVE)
+                URL=$(jq -er '.containerServices[0].url' <<< "$SERVICE")
+                curl --fail --silent --show-error --retry 5 --retry-all-errors \
+                  --retry-delay 5 --connect-timeout 10 --max-time 30 "$URL" -o /dev/null
+                printf 'Lightsail deployment %s: %s\n' "$DEPLOY_VERSION" "$URL" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              FAILED|INACTIVE)
+                echo 'Deployment failed or was superseded. Check Lightsail deployment logs.' >&2
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+          echo 'Timed out waiting for Lightsail deployment.' >&2
+          exit 1
